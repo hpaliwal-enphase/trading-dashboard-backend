@@ -5,6 +5,9 @@ const Investment = require('../models/Investment');
 const CurrencyData = require('../models/CurrencyData');
 const AuditLog = require('../models/AuditLog');
 const { adminAuth } = require('../middleware/auth');
+const InvestmentCalculator = require('../services/investmentCalculator');
+const MonthlyReturn = require('../models/MonthlyReturn');
+const PlatformInvestment = require('../models/PlatformInvestment');
 
 const router = express.Router();
 
@@ -31,14 +34,37 @@ router.get('/clients', adminAuth, async (req, res) => {
                     status: 'active'
                 });
 
-                const totalInvestment = investments.reduce((sum, inv) => sum + inv.initialAmount, 0);
-                const currentValue = investments.reduce((sum, inv) => sum + inv.currentAmount, 0);
+                // Calculate total investment (deposits - withdrawals)
+                const totalInvestment = investments.reduce((sum, inv) => {
+                    return sum + (inv.type === 'withdrawal' ? -inv.amount : inv.amount);
+                }, 0);
+
+                // Get the latest monthly return for current value
+                const latestReturn = await MonthlyReturn.findOne({
+                    'clientReturns.clientId': client._id
+                })
+                    .sort('-month')
+                    .lean();
+
+                let currentValue = totalInvestment;
+                if (latestReturn) {
+                    const clientReturn = latestReturn.clientReturns.find(
+                        cr => cr.clientId.toString() === client._id.toString()
+                    );
+                    if (clientReturn && clientReturn.closingBalance) {
+                        currentValue = clientReturn.closingBalance;
+                    }
+                }
+
+                const totalReturn = totalInvestment > 0
+                    ? ((currentValue - totalInvestment) / totalInvestment * 100).toFixed(2)
+                    : 0;
 
                 return {
                     ...client.toObject(),
-                    totalInvestment,
-                    currentValue,
-                    totalReturn: totalInvestment > 0 ? ((currentValue - totalInvestment) / totalInvestment * 100).toFixed(2) : 0
+                    totalInvestment: totalInvestment || 0,
+                    currentValue: currentValue || 0,
+                    totalReturn: parseFloat(totalReturn) || 0
                 };
             })
         );
@@ -209,7 +235,8 @@ router.get('/audit-logs', adminAuth, async (req, res) => {
 router.post('/investments', adminAuth, [
     body('clientId').notEmpty(),
     body('amount').isFloat({ min: 0 }),
-    body('investmentDate').isISO8601()
+    body('investmentDate').isISO8601(),
+    body('type').isIn(['deposit', 'withdrawal'])
 ], async (req, res) => {
     try {
         const errors = validationResult(req);
@@ -217,20 +244,28 @@ router.post('/investments', adminAuth, [
             return res.status(400).json({ errors: errors.array() });
         }
 
-        const { clientId, amount, investmentDate } = req.body;
+        const { clientId, amount, investmentDate, type } = req.body;
 
         const investment = new Investment({
             clientId,
             investmentDate: new Date(investmentDate),
-            initialAmount: amount,
-            currentAmount: amount
+            amount: amount,
+            type: type
         });
 
-        console.log(investment);
-
         await investment.save();
+
+        // Trigger recalculation
+        try {
+            await InvestmentCalculator.recalculateFromDate(new Date(investmentDate));
+        } catch (calcError) {
+            console.error('Recalculation error:', calcError);
+            // Don't fail the investment creation if recalculation fails
+        }
+
         res.status(201).json(investment);
     } catch (error) {
+        console.error('Investment creation error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -718,6 +753,268 @@ router.post('/platform-investments/bulk-update', adminAuth, [
             message: 'Platform returns updated',
             results
         });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Enter weekly platform data
+router.post('/platforms/weekly-data', adminAuth, [
+    body('platformId').notEmpty(),
+    body('weekStartDate').isISO8601(),
+    body('closingValue').isFloat({ min: 0 }),
+    body('notes').optional().isString()
+], async (req, res) => {
+    try {
+        const { platformId, weekStartDate, closingValue, notes } = req.body;
+
+        const platform = await PlatformInvestment.findById(platformId);
+        if (!platform) {
+            return res.status(404).json({ error: 'Platform not found' });
+        }
+
+        const startDate = new Date(weekStartDate);
+        const endDate = new Date(startDate);
+        endDate.setDate(endDate.getDate() + 6);
+
+        // Get previous week's closing value as opening value
+        const previousWeek = await WeeklyPlatformData.findOne({
+            platformId,
+            weekEndDate: { $lt: startDate }
+        }).sort('-weekEndDate');
+
+        const openingValue = previousWeek ? previousWeek.closingValue : platform.amount;
+        const profitAmount = closingValue - openingValue;
+        const weeklyReturn = ((closingValue - openingValue) / openingValue) * 100;
+
+        const weeklyData = new WeeklyPlatformData({
+            platformId,
+            weekStartDate: startDate,
+            weekEndDate: endDate,
+            weekNumber: getWeekNumber(startDate),
+            year: startDate.getFullYear(),
+            openingValue,
+            closingValue,
+            weeklyReturn,
+            profitAmount,
+            notes,
+            enteredBy: req.user.id
+        });
+
+        await weeklyData.save();
+
+        // Update platform's current value
+        platform.currentValue = closingValue;
+        await platform.save();
+
+        res.json({ message: 'Weekly data saved successfully', weeklyData });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get weekly performance overview
+router.get('/platforms/weekly-performance', adminAuth, async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+
+        const query = {};
+        if (startDate) query.weekStartDate = { $gte: new Date(startDate) };
+        if (endDate) query.weekEndDate = { $lte: new Date(endDate) };
+
+        const weeklyData = await WeeklyPlatformData.find(query)
+            .populate('platformId', 'platformName')
+            .sort('weekStartDate');
+
+        // Group by week
+        const weeklyPerformance = {};
+
+        weeklyData.forEach(data => {
+            const weekKey = data.weekStartDate.toISOString().split('T')[0];
+
+            if (!weeklyPerformance[weekKey]) {
+                weeklyPerformance[weekKey] = {
+                    weekStartDate: data.weekStartDate,
+                    weekEndDate: data.weekEndDate,
+                    platforms: [],
+                    totalOpeningValue: 0,
+                    totalClosingValue: 0,
+                    totalProfit: 0,
+                    overallReturn: 0
+                };
+            }
+
+            weeklyPerformance[weekKey].platforms.push({
+                platformName: data.platformId.platformName,
+                openingValue: data.openingValue,
+                closingValue: data.closingValue,
+                profit: data.profitAmount,
+                return: data.weeklyReturn,
+                isInterpolated: data.isInterpolated
+            });
+
+            weeklyPerformance[weekKey].totalOpeningValue += data.openingValue;
+            weeklyPerformance[weekKey].totalClosingValue += data.closingValue;
+            weeklyPerformance[weekKey].totalProfit += data.profitAmount;
+        });
+
+        // Calculate overall return for each week
+        Object.values(weeklyPerformance).forEach(week => {
+            week.overallReturn = ((week.totalClosingValue - week.totalOpeningValue) / week.totalOpeningValue) * 100;
+        });
+
+        res.json(Object.values(weeklyPerformance));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Calculate monthly returns from weekly data
+router.post('/monthly-returns/calculate-from-weekly', adminAuth, [
+    body('month').isISO8601()
+], async (req, res) => {
+    try {
+        const { month } = req.body;
+        const monthDate = new Date(month);
+        const startOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+        const endOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0);
+
+        // Get all weekly data for the month
+        const weeklyData = await WeeklyPlatformData.find({
+            weekStartDate: { $gte: startOfMonth },
+            weekEndDate: { $lte: endOfMonth }
+        });
+
+        // Handle missing weeks with interpolation
+        await interpolateMissingWeeks(startOfMonth, endOfMonth);
+
+        // Calculate aggregate monthly return
+        const monthlyReturn = await calculateMonthlyReturnFromWeekly(monthDate);
+
+        // Use the existing InvestmentCalculator
+        await InvestmentCalculator.calculateMonthlyReturns(monthDate, monthlyReturn);
+
+        res.json({
+            message: 'Monthly returns calculated successfully',
+            monthlyReturn,
+            weeksUsed: weeklyData.length
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Helper function to interpolate missing weeks
+async function interpolateMissingWeeks(startDate, endDate) {
+    const platforms = await PlatformInvestment.find({ status: 'active' });
+
+    for (const platform of platforms) {
+        const existingWeeks = await WeeklyPlatformData.find({
+            platformId: platform._id,
+            weekStartDate: { $gte: startDate, $lte: endDate }
+        }).sort('weekStartDate');
+
+        // Find gaps and interpolate
+        let currentWeek = new Date(startDate);
+        while (currentWeek <= endDate) {
+            const weekExists = existingWeeks.some(w =>
+                w.weekStartDate.toDateString() === currentWeek.toDateString()
+            );
+
+            if (!weekExists) {
+                // Find surrounding weeks for interpolation
+                const before = await WeeklyPlatformData.findOne({
+                    platformId: platform._id,
+                    weekEndDate: { $lt: currentWeek }
+                }).sort('-weekEndDate');
+
+                const after = await WeeklyPlatformData.findOne({
+                    platformId: platform._id,
+                    weekStartDate: { $gt: currentWeek }
+                }).sort('weekStartDate');
+
+                if (before && after) {
+                    // Linear interpolation
+                    const weeksBetween = Math.ceil((after.weekStartDate - before.weekEndDate) / (7 * 24 * 60 * 60 * 1000));
+                    const valueChange = after.openingValue - before.closingValue;
+                    const changePerWeek = valueChange / weeksBetween;
+
+                    const interpolatedValue = before.closingValue + changePerWeek;
+
+                    await WeeklyPlatformData.create({
+                        platformId: platform._id,
+                        weekStartDate: currentWeek,
+                        weekEndDate: new Date(currentWeek.getTime() + 6 * 24 * 60 * 60 * 1000),
+                        weekNumber: getWeekNumber(currentWeek),
+                        year: currentWeek.getFullYear(),
+                        openingValue: before.closingValue,
+                        closingValue: interpolatedValue,
+                        weeklyReturn: ((interpolatedValue - before.closingValue) / before.closingValue) * 100,
+                        profitAmount: interpolatedValue - before.closingValue,
+                        isInterpolated: true,
+                        notes: 'Auto-interpolated'
+                    });
+                }
+            }
+
+            currentWeek.setDate(currentWeek.getDate() + 7);
+        }
+    }
+}
+
+// Calculate monthly return from weekly data
+async function calculateMonthlyReturnFromWeekly(monthDate) {
+    const startOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth(), 1);
+    const endOfMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0);
+
+    const platforms = await PlatformInvestment.find({ status: 'active' });
+    let totalMonthStart = 0;
+    let totalMonthEnd = 0;
+
+    for (const platform of platforms) {
+        // Get first week of month
+        const firstWeek = await WeeklyPlatformData.findOne({
+            platformId: platform._id,
+            weekStartDate: { $gte: startOfMonth }
+        }).sort('weekStartDate');
+
+        // Get last week of month
+        const lastWeek = await WeeklyPlatformData.findOne({
+            platformId: platform._id,
+            weekEndDate: { $lte: endOfMonth }
+        }).sort('-weekEndDate');
+
+        if (firstWeek && lastWeek) {
+            totalMonthStart += firstWeek.openingValue;
+            totalMonthEnd += lastWeek.closingValue;
+        }
+    }
+
+    return ((totalMonthEnd - totalMonthStart) / totalMonthStart) * 100;
+}
+
+// Get recent monthly returns
+router.get('/monthly-returns/recent', adminAuth, async (req, res) => {
+    try {
+        const recentReturns = await MonthlyReturn.find()
+            .sort('-month')
+            .limit(12) // Last 12 months
+            .select('month totalCorpus monthlyReturnPercentage clientReturns calculatedAt');
+
+        // Calculate total returns for each month
+        const returnsWithTotals = recentReturns.map(monthReturn => {
+            const totalReturns = monthReturn.clientReturns.reduce(
+                (sum, client) => sum + client.returnAmount,
+                0
+            );
+
+            return {
+                ...monthReturn.toObject(),
+                totalReturns
+            };
+        });
+
+        res.json(returnsWithTotals);
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

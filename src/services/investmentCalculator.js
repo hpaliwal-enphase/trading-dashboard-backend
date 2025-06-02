@@ -89,13 +89,17 @@ class InvestmentCalculator {
             totalCorpus += amount;
         });
 
-        // Calculate percentages
+        // Calculate percentages - handle zero corpus case
         Object.values(clientInvestments).forEach(client => {
-            client.sharePercentage = (client.totalInvestment / totalCorpus * 100).toFixed(2);
+            if (totalCorpus === 0) {
+                client.sharePercentage = 0;
+            } else {
+                client.sharePercentage = parseFloat((client.totalInvestment / totalCorpus * 100).toFixed(2));
+            }
         });
 
         return {
-            totalCorpus,
+            totalCorpus: totalCorpus || 0, // Ensure it's never undefined/NaN
             clientShares: Object.values(clientInvestments)
         };
     }
@@ -130,12 +134,16 @@ class InvestmentCalculator {
      * Calculate weighted return across all platforms
      */
     static calculateWeightedReturn(platformReturns) {
+        if (!platformReturns.totalValue || platformReturns.totalValue === 0) {
+            return 0;
+        }
+
         let weightedReturn = 0;
         const totalValue = platformReturns.totalValue;
 
         platformReturns.platforms.forEach(platform => {
             const weight = platform.currentValue / totalValue;
-            weightedReturn += platform.returnPercentage * weight;
+            weightedReturn += (platform.returnPercentage || 0) * weight;
         });
 
         return weightedReturn;
